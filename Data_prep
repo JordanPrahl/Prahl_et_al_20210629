@@ -1,0 +1,241 @@
+---
+title: "Prahl_et_al Data prep"
+author: "Jordan Prahl"
+date: "6/29/2021"
+output: html_document
+---
+
+## Introduction
+I am comparing RNAseq data from my rs356182-lesion clones to several wildtype controls (both differentiated and undifferentiated).Samples needed to be unpacked, have the adapters trimmed off, be aligned to a reference genome, and output a reads/gene count file. This was done in several steps below. The presence of both single end and paired-end data made the analysis more complicated. 
+
+## Processing data on the HPC
+
+The Genomics core provided us with fastq files from our RNAseq experiments. For this analysis, I am pulling from three different experiments (Single-end read LUHMES differentiated vs undifferentiated, paired-end read LUHMES differentiated vs undifferentiated, and my lesion clones). The fastq files were collected into one directory in my folder on the server. For the sake of brevity, I have removed all of the extra stuff I would normally include in code to echo job details Or provide simple instructions for myself. First I index the reference genome. I included the code for retrieving the genome for reference.
+
+```{bash, eval=FALSE, Genome_index}
+#PBS -l nodes=1:ppn=4
+#PBS -l mem=24gb
+#PBS -l walltime=24:00:00
+#PBS -N GRCh38_index
+#PBS -M jordan.prahl@vai.org
+#PBS -m abe
+#PBS -V
+
+#--------- PBS VARIABLES
+#- #PBS -l nodes=1:ppn=1 == ppn=1 means using 1 core per job
+#- #PBS -l mem=6gb == 6gb of ram per 1 core (if ppn=4 change mem=24gb)
+#- #PBS -l walltime=24:00:00 == 24 hours max runtime
+#- #PBS -q shortq == choose queue shortq < 72hrs, longq > 72hrs (qstat -q)
+#- #PBS -N Job_Name_Here == job name sepcific to your script
+#- #PBS -t 1-20 == 20 samples and 20 jobs to submit
+#- #PBS -j oe == job standard error and output files merged
+#- #PBS -M First_Name.LastName@vai.org == vai email
+#- #PBS -m abe == a = email if aborted, b = email when started, e = email when finished 
+#- #PBS -V == head node environment passed to job node environment
+
+#--------- Gencode
+#- Human Gencode_GRCh38_p10
+## https://www.gencodegenes.org/human/
+## wget ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_34/gencode.v34.primary_assembly.annotation.gff3.gz
+## wget ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_34/GRCh38.primary_assembly.genome.fa.gz
+## gunzip GRCh38.primary_assembly.genome.fa.gz
+## gunzip gencode.v34.primary_assembly.annotation.gtf.gz
+
+#--------- Number of CORES (change PBS ppn)
+numcores=4
+
+# Load in the STAR module I use to index the genome
+module initadd bbc/STAR/STAR-2.7.8a
+
+# Map out my directories
+projectDir=~/coetzee-primary/Prahl/Bioinformatics_Resources
+inDir=${projectDir}/genomes
+fasta=${inDir}/GRCh38.primary_assembly.genome.fa
+gtf=${inDir}/gencode.v34.primary_assembly.annotation.gtf
+outDir=${inDir}/STAR_index 
+mkdir -p ${outDir}
+
+# Run the STAR function
+STAR --runThreadN ${numcores} \
+                --runMode genomeGenerate \
+                --genomeDir ${outDir} \
+                --genomeFastaFiles ${fasta} \
+                --sjdbGTFfile ${gtf} \
+                --sjdbOverhang 75
+
+```
+
+Next, I use TRIMGALORE to remove the adapters from the reads in each file.
+
+```{bash, eval=FALSE, TRIMGALORE}
+#PBS -l nodes=1:ppn=28
+#PBS -l walltime=24:00:00
+#PBS -N 20210429_Trimgalore
+#PBS -M jordan.prahl@vai.org
+#PBS -V
+#PBS -t 1-42
+#PBS -m a
+
+
+#--------- PBS VARIABLES
+#- #PBS -l nodes=1:ppn=1 == ppn=1 means using 1 core per job
+#- #PBS -l mem=6gb == 6gb of ram per 1 core (if ppn=4 change mem=24gb)
+#- #PBS -l walltime=24:00:00 == 24 hours max runtime
+#- #PBS -q shortq == choose queue shortq < 72hrs, longq > 72hrs (qstat -q)
+#- #PBS -N Job_Name_Here == job name sepcific to your script
+#- #PBS -t 1-20 == 20 samples and 20 jobs to submit
+#- #PBS -j oe == job standard error and output files merged
+#- #PBS -M First_Name.LastName@vai.org == vai email
+#- #PBS -m abe == a = email if aborted, b = email when started, e = email when finished 
+#- #PBS -V == head node environment passed to job node environment
+
+
+PROJECT=COEG_20200225_RNA
+
+module add bbc/cutadapt/cutadapt-3.2
+module add bbc/fastqc/fastqc-0.11.9 
+module add bbc/trim_galore/trim_galore-0.6.0 
+
+baseDir=~/coetzee-primary/Prahl/Bioinformatics_Resources
+proDir=${baseDir}/Projects/${PROJECT}
+genDir=${baseDir}/genomes
+trimDir=${proDir}/RNA_seq3
+mkdir -p ${trimDir}
+bamDir=${trimDir}/STAR
+mkdir -p ${bamDir}
+
+sampleFile=${proDir}/sampleNames.sh
+
+sampleName=`head -n ${PBS_ARRAYID} ${sampleFile} | tail -n1`
+
+inFile1=${proDir}/${sampleName}_R1.fastq
+inFile2=${proDir}/${sampleName}_R2.fastq
+
+trim_galore \
+	--quality 20 \
+       --phred33 \
+       --fastqc \
+       --length 20 \
+       --output_dir ${trimDir} \
+	   --paired \
+       ${inFile1} ${inFile2} 
+
+
+```
+
+Next, I align my trimmed reads to the reference genome using STAR.
+
+```{bash, eval=FALSE, STAR_Alignment}
+#PBS -l nodes=1:ppn=28
+#PBS -l walltime=24:00:00
+#PBS -N 20210430_STAR_pe
+#PBS -M jordan.prahl@vai.org
+#PBS -m a
+#PBS -V
+#PBS -t 1-42
+
+#--------- PBS VARIABLES
+#- #PBS -l nodes=1:ppn=1 == ppn=1 means using 1 core per job, 1 defaults to open node and node030 puts you on 3
+#- #PBS -l mem=5gb == 5gb of ram per 1 core (if ppn=4 change mem=24gb)
+#- #PBS -l walltime=24:00:00 == 24 hours max runtime
+#- #PBS -q shortq == choose queue shortq < 72hrs, longq > 72hrs (qstat -q)
+#- #PBS -N Job_Name_Here == job name sepcific to your script
+#- #PBS -t 1-20 == 20 samples and 20 jobs to submit
+#- #PBS -j oe == job standard error and output files merged
+#- #PBS -M First_Name.LastName@vai.org == vai email
+#- #PBS -m abe == a = email if aborted, b = email when started, e = email when finished
+#- #PBS -V == head node environment passed to job node environment
+
+PROJECT=COEG_20200225_RNA
+
+CORES=28
+
+
+baseDir=~/coetzee-primary/Prahl/Bioinformatics_Resources
+proDir=${baseDir}/Projects/${PROJECT}
+genDir=${baseDir}/genomes
+trimDir=${proDir}/RNA_seq3
+bamDir=${trimDir}/STAR
+mkdir -p ${bamDir}
+
+module add bbc/STAR/STAR-2.7.8a
+
+cd ${proDir}
+sort -u sampleNames.sh
+SAMPLEFILE=${proDir}/sampleNames.sh
+
+SAMPLENAME=`head -n ${PBS_ARRAYID} ${SAMPLEFILE} | tail -n1`
+
+
+INFILE1=${trimDir}/${SAMPLENAME}_R1_val_1.fq
+INFILE2=${trimDir}/${SAMPLENAME}_R2_val_2.fq
+
+
+STAR --runMode alignReads \
+       --runThreadN ${CORES} \
+       --genomeDir ${genDir}/STAR_index \
+       --genomeLoad NoSharedMemory \
+       --readFilesIn ${INFILE1} ${INFILE2}  \
+       --outFileNamePrefix ${bamDir}/${SAMPLENAME}_ \
+       --outReadsUnmapped None \
+       --outSAMtype BAM SortedByCoordinate \
+       --outFilterMismatchNoverLmax 0.1 \
+       --quantMode GeneCounts \
+       --twopassMode Basic
+
+```
+
+If you want to use your BAM files to do further analysis, like reading into IGV, you need to index the bam files.
+
+```{bash, eval=FALSE, Index_BAM_files}
+
+CORES=1
+
+# Map out directories
+PROJECT=COEG_20200225_RNA
+baseDir=~/coetzee-primary/Prahl/Bioinformatics_Resources
+proDir=${baseDir}/Projects/${PROJECT}
+genDir=${baseDir}/genomes
+trimDir=${proDir}/RNA_seq
+bamDir=${trimDir}/STAR
+
+### Create an array variable to call each file
+SAMPLEFILE=${proDir}/sampleNames.sh
+SAMPLENAME=`head -n ${PBS_ARRAYID} ${SAMPLEFILE} | tail -n1`
+
+
+INFILE=${bamDir}/${SAMPLENAME}_Aligned.sortedByCoord.out.bam
+
+### Load up the samtools module
+module add bbc/samtools/samtools-1.9
+
+### Simple code to index your BAM files
+samtools index ${INFILE}
+
+```
+
+The last thing you need in order to manipulate your samples in IGV is the bigwig file.The code to generate this file is simple.
+
+```{bash, eval=FALSE, BIGWIG}
+
+# First I map out where my data is going. The raw fastq.gz files are in the project directory (proDir).
+PROJECT=COEG_20200225_RNA
+baseDir=~/coetzee-primary/Prahl/Bioinformatics_Resources
+proDir=${baseDir}/Projects/${PROJECT}
+genDir=${baseDir}/genomes
+trimDir=${proDir}/RNA_seq
+bamDir=${trimDir}/STAR
+mkdir -p ${bamDir}
+
+### Create an array variable to call each file
+SAMPLEFILE=${proDir}/sampleNames.sh
+SAMPLENAME=`head -n ${PBS_ARRAYID} ${SAMPLEFILE} | tail -n1`
+
+### Load up the required deeptools module
+module add bbc/deeptools/deeptools-3.4.3
+
+bamcoverage -b ${bamDir}/${SAMPLENAME}_Aligned.sortedByCoord.out.bam -o ${SAMPLENAME}.bw
+```
+
+I think you could theoretically do all of this in one big script, but I was never able to get it to run smooth all the way through (especially with single-end data mixed in with the paired-end data). Doing so would provide a clearer set of steps and abbreviate the need to repeat the directory mapping and sample name calling in each script.
+
